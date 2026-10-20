@@ -447,7 +447,6 @@ def main():
             message = make_alert(candidate, is_new, previous)
             if dry_run:
                 LOG.info("DRY RUN — no Telegram message sent:\n%s", message)
-                state["last_alert"][key] = now
                 sent_this_run += 1
             elif telegram_send(message):
                 state["last_alert"][key] = now
