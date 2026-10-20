@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -19,21 +18,37 @@ from urllib.request import Request, urlopen
 LOG = logging.getLogger("early-token-scanner")
 STATE_PATH = Path(os.getenv("STATE_FILE", "data/early-token-scanner-state.json"))
 DEX_BASE = "https://api.dexscreener.com"
-BINANCE_BASE = "https://www.binance.com"
-USER_AGENT = "EarlyTokenScanner/1.0 (research-only)"
+USER_AGENT = "EarlyTokenScanner/1.1 (research-only)"
 
 
-def get_json(url: str, timeout: int = 20):
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+def get_json(url: str, timeout: int = 20, headers=None):
+    request_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+    request = Request(url, headers=request_headers)
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def safe_float(value, default=0.0):
     try:
+        if value is None or value == "":
+            return default
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def first_value(item, *keys):
+    """Return the first non-empty value from a dictionary."""
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def load_state():
@@ -80,7 +95,7 @@ def telegram_send(message: str) -> bool:
         with urlopen(request, timeout=20) as response:
             result = json.loads(response.read().decode("utf-8"))
         if not result.get("ok"):
-            LOG.error("Telegram API rejected the message.")
+            LOG.error("Telegram API rejected the message: %s", result.get("description", "unknown error"))
             return False
         return True
     except Exception as exc:
@@ -147,61 +162,157 @@ def fetch_solana_candidates():
             "fdv_usd": safe_float(pair.get("fdv")),
             "source": "DEX Screener",
         })
+    LOG.info("Solana discovery: %d candidates.", len(candidates))
     return candidates
 
 
+def extract_binance_token_list(response_data):
+    """Tolerate known direct and nested Binance response shapes."""
+    if isinstance(response_data, list):
+        return response_data
+    if not isinstance(response_data, dict):
+        return None
+
+    code = response_data.get("code")
+    if code not in (None, "", "000000", 0, "0"):
+        LOG.warning(
+            "Binance Alpha API returned code=%s message=%s",
+            code,
+            response_data.get("message") or response_data.get("msg") or "unknown",
+        )
+        return None
+    if response_data.get("success") is False:
+        LOG.warning(
+            "Binance Alpha API reported failure: %s",
+            response_data.get("message") or response_data.get("msg") or "unknown",
+        )
+        return None
+
+    data = response_data.get("data")
+    for _ in range(5):
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return None
+        next_data = None
+        for key in ("tokens", "list", "data", "tokenList", "alphaTokenList", "items"):
+            if isinstance(data.get(key), (dict, list)):
+                next_data = data[key]
+                break
+        if next_data is None:
+            return None
+        data = next_data
+    return data if isinstance(data, list) else None
+
+
 def fetch_binance_alpha_candidates():
-    """Best-effort public Alpha token feed; Binance may change endpoint/schema."""
+    """Fetch Binance Alpha token-list data and normalize it for alerts.
+
+    Binance can change public endpoints and response fields. Every failure is
+    logged so a zero-candidate run can be diagnosed from GitHub Actions logs.
+    """
     endpoints = [
-        f"{BINANCE_BASE}/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list",
-        f"{BINANCE_BASE}/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/token/list",
+        "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list",
+        "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/token/list",
     ]
-    response_data = None
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.binance.com/en/alpha",
+        "Origin": "https://www.binance.com",
+    }
+
+    payload = None
     for endpoint in endpoints:
         try:
-            response_data = get_json(endpoint)
-            if response_data:
+            result = get_json(endpoint, timeout=25, headers=headers)
+            payload = extract_binance_token_list(result)
+            if payload is not None:
+                LOG.info(
+                    "Binance Alpha endpoint returned %d token records: %s",
+                    len(payload),
+                    endpoint,
+                )
                 break
+            LOG.warning(
+                "Binance Alpha response schema not recognized at %s; top-level keys=%s",
+                endpoint,
+                list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+            )
+        except HTTPError as exc:
+            LOG.warning("Binance Alpha HTTP error at %s: %s", endpoint, exc)
+        except URLError as exc:
+            LOG.warning("Binance Alpha network error at %s: %s", endpoint, exc)
         except Exception as exc:
-            LOG.info("Binance Alpha endpoint unavailable: %s", exc)
+            LOG.warning("Binance Alpha request failed at %s: %s", endpoint, exc)
 
-    if not isinstance(response_data, dict):
-        return []
-    payload = response_data.get("data")
-    if isinstance(payload, dict):
-        payload = payload.get("tokens") or payload.get("list") or payload.get("data")
-    if not isinstance(payload, list):
-        LOG.warning("Binance Alpha response format was not recognized; skipping this source.")
+    if payload is None:
+        LOG.error("Binance Alpha discovery failed on all configured endpoints.")
         return []
 
     candidates = []
+    skipped = 0
     for item in payload:
         if not isinstance(item, dict):
+            skipped += 1
             continue
-        symbol = str(item.get("symbol") or item.get("tokenSymbol") or "?")[:30]
-        name = str(item.get("name") or item.get("tokenName") or symbol)[:70]
-        address = str(item.get("contractAddress") or item.get("address") or item.get("tokenAddress")
-                      or item.get("alphaId") or item.get("id") or symbol).strip()
+
+        symbol = str(first_value(item, "symbol", "tokenSymbol", "ticker") or "").strip()[:30]
+        name = str(first_value(item, "name", "tokenName", "fullName") or symbol or "Unknown").strip()[:70]
+        alpha_id = str(first_value(item, "alphaId", "alphaTokenId") or "").strip()
+        contract = str(first_value(item, "contractAddress", "address", "tokenAddress", "contract") or "").strip()
+        token_id = str(first_value(item, "tokenId", "id") or "").strip()
+        address = contract or alpha_id or token_id
+
+        if not address:
+            skipped += 1
+            continue
+
+        # Field names vary between token-list versions; don't invent values.
+        price = safe_float(first_value(item, "price", "priceUsd", "priceUSD"))
+        volume_24h = safe_float(first_value(
+            item, "volume24h", "volume24H", "volume", "volumeUsd", "volumeUSD", "tradingVolume"
+        ))
+        price_change_24h = safe_float(first_value(
+            item, "percentChange24h", "priceChange24h", "priceChangePercent", "priceChange"
+        ))
+        fdv = safe_float(first_value(item, "fdv", "marketCap", "fullyDilutedValuation", "fdvUsd"))
+        liquidity = safe_float(first_value(item, "liquidity", "liquidityUsd", "liquidityUSD"))
+        listing_time = first_value(item, "listingTime", "launchTime", "createTime", "createdAt")
+
         candidates.append({
             "market": "binance_alpha",
             "address": address,
-            "symbol": symbol,
+            "symbol": symbol or alpha_id or token_id or "UNKNOWN",
             "name": name,
             "url": "https://www.binance.com/en/alpha",
             "pair_address": "",
-            "created_at_ms": None,
-            "price_usd": safe_float(item.get("price") or item.get("priceUsd")),
-            "liquidity_usd": safe_float(item.get("liquidity") or item.get("liquidityUsd")),
+            "created_at_ms": listing_time,
+            "price_usd": price,
+            "liquidity_usd": liquidity,
             "volume_m5_usd": 0.0,
-            "volume_h1_usd": safe_float(item.get("volume24h") or item.get("volume")),
+            # This is a best-effort token-list value; only label it 24h if supplied.
+            "volume_h1_usd": volume_24h,
             "buys_m5": 0,
             "sells_m5": 0,
             "buys_h1": 0,
             "sells_h1": 0,
-            "price_change_h1_pct": safe_float(item.get("priceChange1h") or item.get("priceChangePercent")),
-            "fdv_usd": safe_float(item.get("fdv") or item.get("fullyDilutedValuation")),
-            "source": "Binance Alpha (best effort)",
+            "price_change_h1_pct": price_change_24h,
+            "fdv_usd": fdv,
+            "source": "Binance Alpha public token list",
         })
+
+    LOG.info("Binance Alpha discovery: %d candidates; %d skipped.", len(candidates), skipped)
+    if candidates:
+        LOG.info(
+            "Binance Alpha sample: %s (%s), identifier=%s",
+            candidates[0]["name"],
+            candidates[0]["symbol"],
+            candidates[0]["address"],
+        )
     return candidates
 
 
@@ -221,6 +332,8 @@ def risk_notes(candidate):
         notes.append("Mint/freeze authority and holder concentration are NOT audited by this scanner")
     else:
         notes.append("Alpha feed presence is not a contract-safety audit")
+        if candidate["liquidity_usd"] <= 0:
+            notes.append("Liquidity not supplied by the token-list feed")
     return notes
 
 
@@ -238,14 +351,25 @@ def make_alert(candidate, is_new, previous):
     reasons = []
     if is_new:
         reasons.append("First observed by this scanner (not necessarily newly launched)")
+
     if candidate["market"] == "solana":
         if candidate["buys_m5"] + candidate["sells_m5"] >= 5:
             reasons.append("At least five transactions reported in the last five minutes")
         prior_volume = safe_float(previous.get("volume_m5_usd"))
         if prior_volume > 0 and candidate["volume_m5_usd"] >= prior_volume * 1.5:
             reasons.append("Reported 5-minute volume is at least 1.5x the prior saved snapshot")
+        volume_lines = [
+            f"5m volume: {fmt_usd(candidate['volume_m5_usd'])}",
+            f"1h volume: {fmt_usd(candidate['volume_h1_usd'])}",
+            f"5m buys/sells: {candidate['buys_m5']}/{candidate['sells_m5']}",
+            f"1h price change: {candidate['price_change_h1_pct']:.2f}%",
+        ]
     else:
-        reasons.append("Present in the available Binance Alpha feed; verify listing status")
+        reasons.append("Present in the available Binance Alpha feed; verify listing and trading status")
+        volume_lines = [
+            f"Reported 24h volume: {fmt_usd(candidate['volume_h1_usd'])}",
+            f"Reported price change: {candidate['price_change_h1_pct']:.2f}%",
+        ]
 
     notes = risk_notes(candidate)
     lines = [
@@ -255,23 +379,26 @@ def make_alert(candidate, is_new, previous):
         f"Address/ID: {candidate['address']}",
         f"Price: ${candidate['price_usd']:.10g}" if candidate["price_usd"] else "Price: unknown",
         f"Liquidity: {fmt_usd(candidate['liquidity_usd'])}",
-        f"5m volume: {fmt_usd(candidate['volume_m5_usd'])}",
-        f"1h volume: {fmt_usd(candidate['volume_h1_usd'])}",
-        f"5m buys/sells: {candidate['buys_m5']}/{candidate['sells_m5']}",
-        f"1h price change: {candidate['price_change_h1_pct']:.2f}%",
-        f"FDV: {fmt_usd(candidate['fdv_usd'])}",
+        *volume_lines,
+        f"FDV/market cap: {fmt_usd(candidate['fdv_usd'])}",
         "",
         "Why flagged:",
-        *([f"• {reason}" for reason in reasons] or ["• Discovery feed match; not enough evidence to confirm momentum"]),
+        *([f"• {reason}" for reason in reasons] or [
+            "• Discovery feed match; not enough evidence to confirm momentum"
+        ]),
         "",
         "Risk notes:",
         *[f"⚠️ {note}" for note in notes],
         "",
+        f"Source: {candidate['source']}",
         f"Chart/source: {candidate['url']}",
     ]
     if candidate["market"] == "solana":
         lines.append(f"Solscan: https://solscan.io/token/{candidate['address']}")
-    lines.extend(["", "RESEARCH ONLY — not a buy signal. Data may be incomplete; verify independently."])
+    lines.extend([
+        "",
+        "RESEARCH ONLY — not a buy signal. Data may be incomplete; verify independently.",
+    ])
     return "\n".join(lines)
 
 
@@ -281,15 +408,22 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
     state = load_state()
-    candidates = fetch_solana_candidates() + fetch_binance_alpha_candidates()
-    logging.info("Fetched %d candidates in total.", len(candidates))
+    solana_candidates = fetch_solana_candidates()
+    alpha_candidates = fetch_binance_alpha_candidates()
+    candidates = solana_candidates + alpha_candidates
+    logging.info(
+        "Fetched %d total candidates (%d Solana, %d Binance Alpha).",
+        len(candidates),
+        len(solana_candidates),
+        len(alpha_candidates),
+    )
     if not candidates:
-        logging.warning("No candidates retrieved. APIs may be unavailable or their response formats may have changed.")
+        LOG.warning("No candidates retrieved. Check API availability and workflow logs.")
 
     now = int(time.time())
-    cooldown = int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600"))
-    max_alerts = int(os.getenv("MAX_ALERTS_PER_RUN", "5"))
-    min_liquidity = float(os.getenv("MIN_SOLANA_LIQUIDITY_USD", "10000"))
+    cooldown = max(0, int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600")))
+    max_alerts = max(0, int(os.getenv("MAX_ALERTS_PER_RUN", "5")))
+    min_liquidity = max(0.0, float(os.getenv("MIN_SOLANA_LIQUIDITY_USD", "10000")))
     dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
     sent_this_run = 0
 
@@ -305,13 +439,14 @@ def main():
                 and (candidate["volume_m5_usd"] > 0 or candidate["volume_h1_usd"] > 0)
             )
         else:
-            # Alpha endpoint payloads vary. Report candidates but clearly mark the source.
+            # Alert Alpha feed entries even when the token-list has sparse market fields.
             eligible = True
 
-        if eligible and (is_new or now - last_alert >= cooldown) and sent_this_run < max_alerts:
+        should_alert = eligible and (is_new or now - last_alert >= cooldown)
+        if should_alert and sent_this_run < max_alerts:
             message = make_alert(candidate, is_new, previous)
             if dry_run:
-                logging.info("DRY RUN — no Telegram message sent:\n%s", message)
+                LOG.info("DRY RUN — no Telegram message sent:\n%s", message)
                 state["last_alert"][key] = now
                 sent_this_run += 1
             elif telegram_send(message):
@@ -326,13 +461,15 @@ def main():
             "last_seen": now,
         }
 
-    # Keep the state file bounded.
+    # Keep state bounded without deleting the duplicate-protection design.
     if len(state["snapshots"]) > 5000:
         state["snapshots"] = dict(list(state["snapshots"].items())[-4000:])
     if len(state["seen"]) > 10000:
         state["seen"] = dict(list(state["seen"].items())[-8000:])
+    if len(state["last_alert"]) > 10000:
+        state["last_alert"] = dict(list(state["last_alert"].items())[-8000:])
     save_state(state)
-    logging.info("Scan complete; alerts processed this run: %d", sent_this_run)
+    LOG.info("Scan complete; alerts sent or simulated this run: %d", sent_this_run)
 
 
 if __name__ == "__main__":
