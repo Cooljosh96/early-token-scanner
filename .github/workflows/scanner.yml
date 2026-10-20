@@ -1,0 +1,58 @@
+name: Early Token Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log alerts without sending Telegram messages
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: early-token-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      STATE_FILE: data/early-token-scanner-state.json
+      MAX_ALERTS_PER_RUN: "5"
+      ALERT_COOLDOWN_SECONDS: "3600"
+      MIN_SOLANA_LIQUIDITY_USD: "10000"
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run scanner
+        run: python early_token_scanner.py
+
+      - name: Save persistent scanner state
+        if: always()
+        run: |
+          if [ -f data/early-token-scanner-state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/early-token-scanner-state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update early token scanner state"
+              git push
+            fi
+          fi
